@@ -1,0 +1,273 @@
+name: Build Release APK
+
+# 只保留手动触发（workflow_dispatch）：
+# 1. 签名构建需要 secrets 且耗时较长，push/PR 触发会白白消耗 Actions 额度；
+# 2. release 包应该由人决定"什么时候出一个可发布版本"，而不是每次提交都产出。
+on:
+  workflow_dispatch:
+    inputs:
+      release_note:
+        description: '本次手动构建的备注（只写进运行名与日志，不参与构建，可留空）'
+        required: false
+        default: ''
+        type: string
+
+# 运行列表里一眼能看出这次手动构建是干什么的，避免一串同名的 "Build Release APK"。
+run-name: "Build signed release APK${{ inputs.release_note != '' && format(' — {0}', inputs.release_note) || '' }}"
+
+# 产物只作为 Actions artifact 提供，不创建 GitHub Release，因此不需要写权限。
+permissions:
+  contents: read
+
+# 同一个工作流串行执行：两次并发构建会往同一个 artifact 名字里塞包，容易拿错产物。
+concurrency:
+  group: build-release-apk
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Assemble signed release APK
+    runs-on: ubuntu-latest
+    # 冷缓存下 Gradle 9.5 + AGP 9.3 全量构建约 10~15 分钟，30 分钟足够且能兜住卡死。
+    timeout-minutes: 30
+
+    env:
+      # 与 app/build.gradle.kts 的 compileSdk(37) / AGP 默认 build-tools 保持一致。
+      # 集中在这里定义，安装与后续 apksigner/aapt2 调用就不会各写一份版本号而失配。
+      #
+      # 注意：SDK 里 37 的包名带主版本后缀，是 `android-37.0` 而不是 `android-37`
+      # （本机 SDK 的 platforms/android-37.0/package.xml 里写的就是 path="platforms;android-37.0"，
+      #  同级还有 android-36.1 这类带小版本号的目录）。写成 android-37 会直接
+      #  "Failed to find package"，所以请勿"顺手修正"回去。
+      ANDROID_PLATFORM: 'android-37.0'
+      ANDROID_BUILD_TOOLS: '37.0.0'
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # 项目在本地是用系统 JDK 21 构建通过的（见 settings.gradle.kts 里移除
+          # foojay-resolver-convention 的注释），Gradle 9.5 / AGP 9.3 / Kotlin 2.4
+          # 也都满足 21 的要求；用 21 而不是最低要求 17，留出余量避免版本不匹配。
+          java-version: '21'
+          cache: gradle
+          # 默认的缓存 hash 只看 *.gradle* 与 wrapper，会把 libs.versions.toml
+          # 里的 AGP/Kotlin 版本变化漏掉（改了依赖版本却命中旧缓存）。
+          cache-dependency-path: |
+            gradle/libs.versions.toml
+            gradle/wrapper/gradle-wrapper.properties
+            **/*.gradle.kts
+            **/*.gradle
+
+      - name: 安装 Android SDK 命令行工具
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 组件
+        # 必须显式装 platform 37：app 用的是新式 DSL `compileSdk { version = release(37) }`，
+        # runner 预装的 SDK 里不保证有对应版本与 build-tools 37.0.0，缺了配置阶段就会失败。
+        # 实际包名见 job env 里的 ANDROID_PLATFORM（是 android-37.0，带主版本后缀，别改成 android-37）。
+        # 这里刻意不做 `|| true` 容错——组件装不上就该让构建红掉并留下日志，
+        # 否则会继续跑到 Gradle 报一堆更难懂的错。
+        run: |
+          set -eu
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            echo "::error::ANDROID_SDK_ROOT / ANDROID_HOME 都没有设置，setup-android 可能没生效。"
+            exit 1
+          fi
+          # 先接受许可，否则 --install 会因 license 未接受而失败。
+          # 临时关掉 pipefail：`yes` 会在 sdkmanager 读够输入退出时被 SIGPIPE 杀掉（141），
+          # 开着 pipefail 会把这种正常情况误判成失败。真正的判据仍是 sdkmanager 自己的退出码。
+          set +o pipefail
+          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses > /dev/null
+          set -o pipefail
+          sdkmanager --sdk_root="$SDK_ROOT" --install \
+            "platforms;$ANDROID_PLATFORM" \
+            "build-tools;$ANDROID_BUILD_TOOLS"
+          # 把实际装上的组件打进日志，万一版本对不上可以直接对照排查
+          sdkmanager --sdk_root="$SDK_ROOT" --list_installed
+
+      - name: 校验签名 secrets 是否齐全
+        # 放在最前面：secrets 缺失时应该 5 秒内失败并说清楚缺哪个，
+        # 而不是等 Gradle 跑十分钟后产出一个未签名的 APK（那样上传出去会误导使用者）。
+        # 只打印是否配置与长度，绝不打印内容。
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_STORE_PASSWORD: ${{ secrets.KEYSTORE_STORE_PASSWORD }}
+          KEYSTORE_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KEYSTORE_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
+        run: |
+          set -u
+          missing=0
+          for name in KEYSTORE_BASE64 KEYSTORE_STORE_PASSWORD KEYSTORE_KEY_ALIAS KEYSTORE_KEY_PASSWORD; do
+            value="${!name:-}"
+            if [ -z "$value" ]; then
+              echo "::error::secret $name 为空。请先在仓库 Settings → Secrets and variables → Actions 里配置该 secret。"
+              missing=1
+            else
+              echo "$name 已配置（长度 ${#value} 字节）"
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::签名 secrets 不完整，无法产出已签名的 release APK，构建终止。"
+            exit 1
+          fi
+
+      - name: 还原密钥库并生成 keystore.properties
+        # 密钥库与口令只存在于这一次性的 runner 上，构建结束后随 runner 销毁；
+        # 全程不 git add，仓库里 .gitignore 也已排除 *.jks / *.keystore / keystore.properties。
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_STORE_PASSWORD: ${{ secrets.KEYSTORE_STORE_PASSWORD }}
+          KEYSTORE_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KEYSTORE_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          # 口令里含反斜杠要在写 properties 之前就拦下来：
+          # .properties 里 `\` 是转义符，Gradle 读到的是被吞掉字符后的口令，
+          # 报错会变成 "Keystore was tampered with, or password was incorrect"，
+          # 极难联想到是转义问题。这里只做字符检查，不打印口令内容。
+          case "$KEYSTORE_STORE_PASSWORD$KEYSTORE_KEY_PASSWORD" in
+            *\\*)
+              echo "::error::签名口令里含反斜杠（\\）。keystore.properties 无法正确表示该字符，会导致 Gradle 读到错误口令并报 Keystore tampered / password incorrect。请改用不含反斜杠的口令重新生成密钥库与 secret。"
+              exit 1
+              ;;
+          esac
+
+          # tr 去掉粘贴时可能混入的换行/空格：base64 必须是单行也能正常工作。
+          # 显式捕获解码失败：否则 set -e 只会把 `base64: invalid input` 抛出来，
+          # 用户不知道该去检查什么。报错文案里不回显任何 secret 内容（连前几位都不）；
+          # 解码器的 stderr 只落到临时文件、不打印，彻底杜绝把输入片段带进日志的可能。
+          ERR_FILE="${RUNNER_TEMP:-/tmp}/base64-decode.err"
+          if ! printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$GITHUB_WORKSPACE/release.keystore" 2> "$ERR_FILE"; then
+            echo "::error::KEYSTORE_BASE64 解码失败。常见原因：①粘贴的是文件路径而不是文件内容；②用 cat 分多行复制导致内容被截断或混入其它字符；③base64 字符串在粘贴时被编辑器/聊天工具截断。请在本地用 \`base64 -w0 your.keystore\`（macOS: \`base64 -i your.keystore\`）重新生成单行字符串后整段粘贴。"
+            exit 1
+          fi
+          if [ ! -s "$GITHUB_WORKSPACE/release.keystore" ]; then
+            echo "::error::release.keystore 解码后为空，请确认 KEYSTORE_BASE64 是密钥库文件的完整 base64（单行）。"
+            exit 1
+          fi
+          chmod 600 "$GITHUB_WORKSPACE/release.keystore"
+
+          # 用 printf 而不是 heredoc 写 properties：值里含有 $ 或空格时不会被二次解释，
+          # 也不会因为 YAML 块缩进被带进行首空白。
+          #
+          # storeFile 必须是绝对路径：app/build.gradle.kts 里写的是
+          #   storeFile = file(keystoreProps.getProperty("storeFile"))
+          # 这个 file() 在 app 模块上下文里解析，相对路径会以 app/ 为基准，
+          # 写 "release.keystore" 会去找 app/release.keystore 而报找不到文件。
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$GITHUB_WORKSPACE/release.keystore" \
+            "$KEYSTORE_STORE_PASSWORD" \
+            "$KEYSTORE_KEY_ALIAS" \
+            "$KEYSTORE_KEY_PASSWORD" > "$GITHUB_WORKSPACE/keystore.properties"
+          chmod 600 "$GITHUB_WORKSPACE/keystore.properties"
+
+          # 只做存在性确认，不 cat 文件内容（里面有口令）
+          echo "keystore.properties 已生成：$(wc -l < "$GITHUB_WORKSPACE/keystore.properties") 行"
+
+      - name: 构建 release APK
+        # --no-daemon：一次性构建，不需要常驻守护进程，省内存也避免 runner 残留进程。
+        # 不加 --offline：首次构建需要下载 AGP/Kotlin/Compose 依赖。
+        run: |
+          set -euo pipefail
+          # 仓库索引里 gradlew 是 100644（没有可执行位），checkout 到 Linux 后必须补上，
+          # 否则会直接 command not found / Permission denied。
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: 校验签名与包信息并整理产物文件名
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            echo "::error::ANDROID_SDK_ROOT / ANDROID_HOME 都没有设置，setup-android 可能没生效。"
+            exit 1
+          fi
+          BUILD_TOOLS_DIR="$SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS"
+          if [ ! -x "$BUILD_TOOLS_DIR/apksigner" ] || [ ! -x "$BUILD_TOOLS_DIR/aapt2" ]; then
+            echo "::error::在 $BUILD_TOOLS_DIR 下找不到 apksigner / aapt2，说明前面装的 build-tools 版本对不上。"
+            exit 1
+          fi
+          APK_DIR="app/build/outputs/apk/release"
+
+          if ! ls -1 "$APK_DIR"/*.apk > /dev/null 2>&1; then
+            echo "::error::$APK_DIR 下没有任何 APK，assembleRelease 没产出预期文件。"
+            exit 1
+          fi
+          APK_COUNT=$(ls -1 "$APK_DIR"/*.apk | wc -l)
+          echo "产物 APK 数量：$APK_COUNT"
+          APK=$(ls -1 "$APK_DIR"/*.apk | head -n 1)
+
+          # 用 aapt2 dump badging 读 package: 行，versionCode/versionName 从 APK 里取而不是写死，
+          # 以后再改版本号不需要回来改 workflow。
+          BADGING=$("$BUILD_TOOLS_DIR/aapt2" dump badging "$APK")
+          PKG_LINE=$(printf '%s\n' "$BADGING" | grep -m1 '^package: ')
+          echo "$PKG_LINE"
+
+          PACKAGE_NAME=$(printf '%s\n' "$PKG_LINE" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+          VERSION_CODE=$(printf '%s\n' "$PKG_LINE" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
+          VERSION_NAME=$(printf '%s\n' "$PKG_LINE" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+
+          if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
+            echo "::error::无法从 aapt2 badging 输出解析 versionName/versionCode，请检查上面打印的 package 行。"
+            exit 1
+          fi
+          # applicationId 被改动属于高风险变更，构建时顺手把住关
+          if [ "$PACKAGE_NAME" != "com.jj.nexusfloat" ]; then
+            echo "::error::applicationId 与预期不符：$PACKAGE_NAME"
+            exit 1
+          fi
+
+          # 签名必须真的存在：没有签名配置时 assembleRelease 也会成功（产出未签名包），
+          # 所以这里显式验签，让"没签上"这件事在这里红掉，而不是让用户装不上才发现。
+          echo "=== apksigner verify ==="
+          "$BUILD_TOOLS_DIR/apksigner" verify --print-certs "$APK"
+
+          # 改成可读文件名，下载下来一眼知道是哪个版本；同一目录内直接改名，
+          # 避免目录里同时留下 app-release.apk 和副本，导致 artifact 里重复打包。
+          TARGET="$APK_DIR/NexusFloat-${VERSION_NAME}-release.apk"
+          if [ "$APK" != "$TARGET" ]; then
+            mv -f "$APK" "$TARGET"
+          fi
+
+          echo "=== 产物列表 ==="
+          ls -lh "$APK_DIR"
+          echo "=== SHA-256 ==="
+          sha256sum "$TARGET" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "## NexusFloat release APK"
+            echo ""
+            echo "- package: \`$PACKAGE_NAME\`"
+            echo "- versionName: \`$VERSION_NAME\`"
+            echo "- versionCode: \`$VERSION_CODE\`"
+            echo "- artifact: \`nexusfloat-release-apk\` → \`$(basename "$TARGET")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusfloat-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          # 目录为空说明构建/改名逻辑出了问题，必须红掉而不是静默上传 0 个文件
+          if-no-files-found: error
+          # 30 天：足够覆盖一次发版的验证周期，也不至于长期占配额
+          retention-days: 30
+
+      - name: 清理密钥库
+        # runner 本身是一次性的，这一步只是兜底（失败时也执行），
+        # 确保工作区里不留下可被后续步骤或日志引用的密钥文件。
+        if: always()
+        run: |
+          rm -f "$GITHUB_WORKSPACE/release.keystore" "$GITHUB_WORKSPACE/keystore.properties"
