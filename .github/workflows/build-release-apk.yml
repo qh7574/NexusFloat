@@ -67,9 +67,11 @@ jobs:
             **/*.gradle.kts
             **/*.gradle
 
-      - name: 安装 Android SDK 命令行工具
-        uses: android-actions/setup-android@v3
-
+      # 不装 android-actions/setup-android：v3 内部会执行 `sdkmanager tools`，而旧版
+      # "tools" 包早已从 Google 的 SDK 仓库下线，实测在 runner 上直接
+      #   Warning: Failed to find package 'tools' → exit code 1
+      # 让整个 job 在第一步就红掉。ubuntu runner 本身预装了 SDK 与 cmdline-tools
+      # （/usr/local/lib/android/sdk），下面直接用预装的 sdkmanager，少一个会坏的依赖。
       - name: 安装 SDK 组件
         # 必须显式装 platform 37：app 用的是新式 DSL `compileSdk { version = release(37) }`，
         # runner 预装的 SDK 里不保证有对应版本与 build-tools 37.0.0，缺了配置阶段就会失败。
@@ -78,22 +80,30 @@ jobs:
         # 否则会继续跑到 Gradle 报一堆更难懂的错。
         run: |
           set -eu
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          if [ -z "$SDK_ROOT" ]; then
-            echo "::error::ANDROID_SDK_ROOT / ANDROID_HOME 都没有设置，setup-android 可能没生效。"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::找不到 Android SDK 目录（$SDK_ROOT），runner 镜像可能变了，请确认 SDK 预装路径。"
             exit 1
           fi
+          # cmdline-tools 的版本号会随镜像更新，不写死路径：取排序最后的一个（版本号最大的）
+          SDKMANAGER=$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "${SDKMANAGER:-}" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::找不到 sdkmanager（查过 $SDK_ROOT/cmdline-tools/*/bin/），无法安装 SDK 组件。"
+            ls -la "$SDK_ROOT" || true
+            exit 1
+          fi
+          echo "使用 sdkmanager: $SDKMANAGER"
           # 先接受许可，否则 --install 会因 license 未接受而失败。
           # 临时关掉 pipefail：`yes` 会在 sdkmanager 读够输入退出时被 SIGPIPE 杀掉（141），
           # 开着 pipefail 会把这种正常情况误判成失败。真正的判据仍是 sdkmanager 自己的退出码。
           set +o pipefail
-          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses > /dev/null
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null
           set -o pipefail
-          sdkmanager --sdk_root="$SDK_ROOT" --install \
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
             "platforms;$ANDROID_PLATFORM" \
             "build-tools;$ANDROID_BUILD_TOOLS"
           # 把实际装上的组件打进日志，万一版本对不上可以直接对照排查
-          sdkmanager --sdk_root="$SDK_ROOT" --list_installed
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --list_installed
 
       - name: 校验签名 secrets 是否齐全
         # 放在最前面：secrets 缺失时应该 5 秒内失败并说清楚缺哪个，
@@ -189,9 +199,9 @@ jobs:
       - name: 校验签名与包信息并整理产物文件名
         run: |
           set -euo pipefail
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          if [ -z "$SDK_ROOT" ]; then
-            echo "::error::ANDROID_SDK_ROOT / ANDROID_HOME 都没有设置，setup-android 可能没生效。"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::找不到 Android SDK 目录（$SDK_ROOT），无法调用 apksigner / aapt2。"
             exit 1
           fi
           BUILD_TOOLS_DIR="$SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS"
