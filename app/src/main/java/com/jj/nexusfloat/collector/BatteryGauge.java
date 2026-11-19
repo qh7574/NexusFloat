@@ -49,19 +49,17 @@ public final class BatteryGauge {
     public Result sample() {
         Result r = new Result();
 
-        float currentA = readCurrentA();
+        // 与监视条一致：先归一化电流，再算功率（v1.9.13）
+        float current = PowerDirection.normalizeCurrent(readCurrentA());
         float voltageV = readVoltageV();
-        String status = readStatusText();
 
-        r.discharging = isDischarging(currentA, status);
-        r.currentA = currentA;
+        float signedPower = powerTracker.resolve(current, voltageV);
+        PowerDirection.Result dir = PowerDirection.resolve(current, voltageV, 1f);
+
+        r.discharging = dir.discharging;
+        r.powerW = signedPower != 0f ? signedPower : dir.powerW;
+        r.currentA = dir.currentA;
         r.voltageV = voltageV;
-
-        float power = powerTracker.resolve(Math.abs(currentA), voltageV,
-                () -> SysfsReader.direct().readBatteryPowerW());
-        if (power > 0f) {
-            r.powerW = r.discharging ? -power : power;
-        }
         return r;
     }
 
@@ -137,19 +135,4 @@ public final class BatteryGauge {
      * status 明确报 Discharging 直接采信；报 Charging 时再看电流——电流明显朝外流
      * 说明供电跟不上、电池在补差额，这时候仍算放电。
      */
-    private boolean isDischarging(float currentA, String status) {
-        if (status != null) {
-            if (Constants.Battery.STATUS_DISCHARGING.equalsIgnoreCase(status)) {
-                return true;
-            }
-            boolean claimsCharging =
-                    Constants.Battery.STATUS_CHARGING.equalsIgnoreCase(status)
-                            || Constants.Battery.STATUS_FULL.equalsIgnoreCase(status);
-            if (claimsCharging) {
-                // 内核说在充电，但电流明显朝外：电池在倒贴
-                return currentA < -Constants.Battery.DISCHARGE_HINT_A;
-            }
-        }
-        return currentA < 0f;
-    }
 }

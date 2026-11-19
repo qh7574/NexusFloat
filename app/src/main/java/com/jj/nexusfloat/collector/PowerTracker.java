@@ -3,83 +3,60 @@ package com.jj.nexusfloat.collector;
 import com.jj.nexusfloat.constant.Constants;
 
 /**
- * 电池功率的取值状态机，决定这一轮用哪个来源的读数。
+ * 功率读取与突变守卫。
  *
- * 单独抽出来是为了能脱离 Android 环境跑单测。功率取值线上出过两次问题
- * （联发科恒 0、高通锁死 -10W），这种判定逻辑还是得有回归保护。
+ * ## 为什么改回电流
  *
- * 两条规则：
- * 一是静态值识别。power_now 连着好几轮读到同一个数，就当成额定功率那类静态量，
- * 以后永远不用了。真实的瞬时功率不可能十秒一字不差。
- * 二是陈旧值上限。读不到的时候可以短暂沿用上次的有效值，把抖动抹平，但沿用是有
- * 次数上限的。数据源彻底失效就回到 0，不能锁死在一个假读数上。
+ * 上一版只读 power_now，结果在用户机器上读出来是 0，整个功率显示消失。
+ * power_now 是 power_supply ABI 里的可选属性，不少机型压根没实现。
+ * current_now 是普遍实现的，配合 voltage_now 就能算出功率。
  *
- * 这里不管正负号，符号由外部的充放电状态决定。
+ * ## 符号怎么处理
  *
- * 类和 resolve 都开成 public：统计侧的充电曲线要用同一套突变守卫，
- * 否则监视条上电流被滤平了，充电记录里却还是那根尖刺，两边对不上。
+ * 电流带符号传入（负放电、正充电），本类只对**绝对值**做区间校验和突变守卫，
+ * 判定通过后按**原始符号**返回。这样负功率不会被误当成「读不到」，
+ * 方向信息也不会在任何一步被抹掉。
  */
 public final class PowerTracker {
 
-    /** 惰性功率来源，真要用的时候才去调，省掉没必要的 sysfs 读取 */
-    public interface Source {
-        /** 返回功率绝对值（W），读不到就 0 */
-        float get();
-    }
-
-    /** power_now 上次读到多少、连着重复了几次，用来认静态额定值 */
-    private float lastPowerNow = -1f;
-    private int powerNowRepeats;
-    private boolean powerNowIsStatic;
-
-    /** 上次的有效功率，以及已经连着沿用了多少轮 */
+    /** 上一次的有效值（保留符号） */
     private float lastValid;
-    private int staleTicks;
-    /** 疑似尖峰（功率突然比上次有效值大一大截）连着出现了几轮 */
+    /** 连续被判成尖峰的次数 */
     private int spikeTicks;
-
-    /**
-     * 上一次 {@link #resolve} 返回的是不是**本拍新读到/新算出**的值。
-     *
-     * false 表示返回的是沿用的旧值（尖峰守卫/陈旧互顶）或者彻底读不到（0）。
-     * 统计侧据此决定这个采样点要不要标成「未知」——监视条不关心，它只看数字。
-     */
+    /** 连续读不到的次数 */
+    private int staleTicks;
+    /** 最近一次返回的是不是新读到的值 */
     private boolean lastFresh;
 
     /**
-     * 按优先级选出这一轮用哪个功率值。
+     * 采一次功率。
      *
-     * currentA 是电流绝对值（A），读不到就传 0；voltageV 是电压。
-     * powerNow 是惰性来源，只有电流那条路走不通、或者这节点已经被判定为
-     * 静态值时才去调它。
-     *
-     * 返回功率绝对值（W），没得用就返回 0。
+     * signedCurrentA 是带符号的电流（A），voltageV 是电压。
+     * 返回带符号功率：负值放电、正值充电。读不到时沿用旧值。
      */
-    public float resolve(float currentA, float voltageV, Source powerNow) {
-        float power = fromCurrent(currentA, voltageV);
-        if (power <= 0) {
-            power = fromPowerNow(powerNow);
-        }
+    public float resolve(float signedCurrentA, float voltageV) {
+        float signedPower = calcPower(signedCurrentA, voltageV);
 
-        if (power > 0) {
-            // 突变守卫：正常功率不会一拍之内翻好几倍。
-            // 疑似尖峰就先沿用上次有效值，连着好几拍都这么大才当成真变化
-            if (isSpike(power)) {
-                if (++spikeTicks < Constants.Battery.POWER_SPIKE_CONFIRM_TICKS) {
-                    lastFresh = false;
-                    return lastValid;
-                }
-                // 连着确认了：接受这个新水平，计数清零
+        if (signedPower != 0f) {
+            float abs = Math.abs(signedPower);
+            // 符号翻转说明充放电方向切换，是真实变化，直接放行
+            boolean signFlip = lastValid != 0f
+                    && (lastValid > 0f) != (signedPower > 0f);
+            if (signFlip || !isSpike(abs)) {
                 spikeTicks = 0;
+            } else if (++spikeTicks < Constants.Battery.POWER_SPIKE_CONFIRM_TICKS) {
+                lastFresh = false;
+                return lastValid;
             } else {
                 spikeTicks = 0;
             }
-            lastValid = power;
+            lastValid = signedPower;
             staleTicks = 0;
             lastFresh = true;
-            return power;
+            return signedPower;
         }
 
+        // 读不到：沿用旧值几拍，之后归零
         if (staleTicks < Constants.Battery.STALE_MAX_TICKS) {
             staleTicks++;
             lastFresh = false;
@@ -91,7 +68,23 @@ public final class PowerTracker {
     }
 
     /**
-     * 上一次 {@link #resolve} 返回的是不是本拍新读到的值。
+     * 电流 × 电压，符号跟着电流。
+     *
+     * 不做 Math.abs——负电流必须算出负功率，否则方向信息在这一步就没了
+     */
+    private static float calcPower(float signedCurrentA, float voltageV) {
+        if (signedCurrentA == 0f || voltageV <= 0f) {
+            return 0f;
+        }
+        float power = signedCurrentA * voltageV;
+        float abs = Math.abs(power);
+        boolean sane = abs >= Constants.Battery.POWER_MIN_W
+                && abs <= Constants.Battery.POWER_MAX_W;
+        return sane ? power : 0f;
+    }
+
+    /**
+     * 上一次 resolve 返回的是不是本拍新读到的值。
      *
      * 必须在每次 resolve 之后立刻读，它反映的是「最近一次调用」的结果。
      */
@@ -100,48 +93,14 @@ public final class PowerTracker {
     }
 
     /**
-     * 是不是疑似尖峰。
-     *
-     * 判据是：上次已经有有效值，新值超过它的若干倍，而且绝对增量也够大。
-     * 两条都得满足，不然小功率区间（0.1W→0.9W）会被误伤。
+     * 是不是疑似尖峰。按绝对值比较，不影响符号。
      */
-    private boolean isSpike(float power) {
-        if (lastValid <= 0f) {
+    private boolean isSpike(float absPower) {
+        if (lastValid == 0f) {
             return false;
         }
-        return power > lastValid * Constants.Battery.POWER_SPIKE_RATIO
-                && power - lastValid > Constants.Battery.POWER_SPIKE_MIN_DELTA_W;
-    }
-
-    /** 电流 × 电压。语义清楚，各平台基本都实现，优先走这条 */
-    private static float fromCurrent(float currentA, float voltageV) {
-        if (currentA <= 0 || voltageV <= 0) {
-            return 0f;
-        }
-        float power = currentA * voltageV;
-        boolean sane = power >= Constants.Battery.POWER_MIN_W
-                && power <= Constants.Battery.POWER_MAX_W;
-        return sane ? power : 0f;
-    }
-
-    /** power_now。只有确认它会变才采纳 */
-    private float fromPowerNow(Source source) {
-        if (powerNowIsStatic || source == null) {
-            return 0f;
-        }
-        float powerNowW = source.get();
-        if (powerNowW <= 0) {
-            return 0f;
-        }
-        if (powerNowW == lastPowerNow) {
-            if (++powerNowRepeats >= Constants.Battery.POWER_CONSTANT_REPEATS) {
-                powerNowIsStatic = true;
-                return 0f;
-            }
-        } else {
-            lastPowerNow = powerNowW;
-            powerNowRepeats = 0;
-        }
-        return powerNowW;
+        float lastAbs = Math.abs(lastValid);
+        return absPower > lastAbs * Constants.Battery.POWER_SPIKE_RATIO
+                && absPower - lastAbs > Constants.Battery.POWER_SPIKE_MIN_DELTA_W;
     }
 }

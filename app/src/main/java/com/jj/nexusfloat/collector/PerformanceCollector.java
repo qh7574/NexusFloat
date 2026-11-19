@@ -97,6 +97,8 @@ public class PerformanceCollector {
     private float lastBatteryTemp = 0f;
     private int lastBatteryVoltageMv = 0;
     private int lastBatteryStatus = BatteryManager.BATTERY_STATUS_UNKNOWN;
+    /** 外接电源状态（v1.9.5）：0 表示没接任何充电器，非 0 表示接了 */
+    private int lastBatteryPlugged = 0;
 
     private long lastFpsTime = 0;
     private int currentFps = 0;
@@ -106,15 +108,19 @@ public class PerformanceCollector {
     private int lastSuccessfulCpuFreqMaxMhz = 0;
     private int lastSuccessfulCpuFreqMinMhz = 0;
     private int lastSuccessfulGpuUsage = -1;
-    /** 功率取值状态机：来源优先级、静态值识别与陈旧值上限都在其中 */
+    /** 功率突变守卫：三条来源（电流×电压 / power_now / 陈旧值）共用一套静态识别 */
     private final PowerTracker powerTracker = new PowerTracker();
+
     /**
-     * 放电时电流的符号（v1.8.13）：-1 表示放电电流为负，+1 表示为正。
-     * 默认按 Android HAL 的约定（负为放电），运行中由 calibrateDischargeSign 修正。
+     * root 通道的失败计数与跳过计数（v1.9.4）。
+     *
+     * SystemUI 里 su 不一定可用。连续失败到这个次数就跳过若干拍，
+     * 只保留低频复探——否则每拍都在起 su、等超时、失败、再退回别的通道。
      */
-    private int dischargeSign = -1;
-    /** 符号约定是否已经从实际样本学到（学到之后不再改） */
-    private boolean dischargeSignKnown;
+    private static final int ROOT_MISS_LIMIT = 3;
+    private static final int ROOT_SKIP_TICKS = 30;
+    private int rootMissStreak;
+    private int rootSkipLeft;
     /** 联发科 FPSGO 逐进程帧率读取；非联发科机型会持续返回 READ_FAILED */
     private final FpsgoReader fpsgoReader = new FpsgoReader();
     /**
@@ -244,6 +250,8 @@ public class PerformanceCollector {
                 lastBatteryTemp = tempInt / 10f;
                 lastBatteryVoltageMv = intent.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0);
                 lastBatteryStatus = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                // 外接电源是硬件事实，方向判定拿它做第一级约束（v1.9.5）
+                lastBatteryPlugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
             }
         }
     };
@@ -271,28 +279,17 @@ public class PerformanceCollector {
             return false;
         }
         try {
-            android.os.BatteryManager bm = (android.os.BatteryManager)
-                    context.getSystemService(Context.BATTERY_SERVICE);
-            if (bm == null) {
-                return false;
+            // 走统一的方向判定（v1.9.12）：看电流符号。
+            //
+            // 和监视条上的功率显示共用同一处实现，所以「功率显示负值」和
+            // 「监视条还在显示」这种自相矛盾的状态不会出现
+            float rawCurrent = SysfsReader.direct().readBatteryCurrentA();
+            if (rawCurrent == 0f) {
+                rawCurrent = SysfsReader.root().readBatteryCurrentA();
             }
-            // getIntProperty 在多数 ROM 上是实时的；读不到退回充电状态
-            int status = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_STATUS);
-            boolean sysCharging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING
-                    || status == android.os.BatteryManager.BATTERY_STATUS_FULL;
-            if (!sysCharging) {
-                return false;
-            }
-            // 系统说在充电，再用 status 节点复核一次：USB 供电不足时它会说 Discharging
-            String nodeStatus = SysfsReader.direct().readBatteryStatus();
-            if (nodeStatus == null) {
-                nodeStatus = SysfsReader.root().readBatteryStatus();
-            }
-            if (nodeStatus != null
-                    && Constants.Battery.STATUS_DISCHARGING.equalsIgnoreCase(nodeStatus)) {
-                return false;
-            }
-            return true;
+            float current = PowerDirection.normalizeCurrent(rawCurrent);
+            float voltage = SysfsReader.direct().readBatteryVoltageV();
+            return !PowerDirection.resolve(current, voltage, 1f).discharging;
         } catch (Throwable t) {
             LogUtils.w("isChargingNow failed", t);
             return false;
@@ -478,15 +475,61 @@ public class PerformanceCollector {
      *
      * 全都失败就退回上次有效值。
      */
+    /**
+     * GPU 频率与占用。
+     *
+     * v1.9.4 做了两处改动，都是为了压住监视条开着时的额外功耗：
+     *
+     * 1. 频率和占用合成一次 root 往返。原来各调一次 GpuRootReader，
+     *    等于每拍两次 su 管道往返。
+     * 2. su 连续失败就熔断。SystemUI 进程里 su 并不总是可用（SELinux 对
+     *    system_server 类进程管得严），原来每拍都会再试一次，失败后再退回
+     *    跨进程 query 和直读文件。三次尝试乘上每秒一次，全是白烧。
+     *    现在连续失败够次数就跳过 root 那一步，只走剩下的通道，并且每
+     *    若干拍才复探一次。
+     */
     private void collectGpuData(PerformanceData data) {
+        int gpuMhz = 0;
+        int usage = -1;
+
         // 第一优先：SystemUI 侧 root 直读（su 可用即得数）
-        int gpuMhz = GpuRootReader.readFreqMhz();
+        boolean tryRoot = true;
+        if (rootMissStreak >= ROOT_MISS_LIMIT) {
+            rootSkipLeft--;
+            if (rootSkipLeft > 0) {
+                tryRoot = false;
+            } else {
+                // 复探这一拍：重置计数，重新给 su 一次机会
+                rootMissStreak = 0;
+                rootSkipLeft = ROOT_SKIP_TICKS;
+            }
+        }
+        if (tryRoot) {
+            int[] both = GpuRootReader.readBoth();
+            gpuMhz = both[0];
+            usage = both[1];
+            if (gpuMhz > 0 || usage >= 0) {
+                rootMissStreak = 0;
+            } else if (++rootMissStreak >= ROOT_MISS_LIMIT) {
+                rootSkipLeft = ROOT_SKIP_TICKS;
+            }
+        }
+
+        // 第二优先：模块进程写好的值（跨进程）
         if (gpuMhz <= 0) {
             gpuMhz = NexusBridge.getGpuFreqMhz();
         }
+        if (usage < 0) {
+            usage = NexusBridge.getGpuUsage();
+        }
+        // 第三优先：本进程直读（部分机型对 system uid 开放）
         if (gpuMhz <= 0) {
             gpuMhz = SysfsReader.direct().readGpuFreqMhz();
         }
+        if (usage < 0) {
+            usage = SysfsReader.direct().readGpuUsagePercent();
+        }
+
         if (gpuMhz <= 0) {
             gpuMhz = lastSuccessfulGpuFreq;
         } else {
@@ -494,13 +537,6 @@ public class PerformanceCollector {
         }
         data.gpuFreq = gpuMhz;
 
-        int usage = GpuRootReader.readUsagePercent();
-        if (usage < 0) {
-            usage = NexusBridge.getGpuUsage();
-        }
-        if (usage < 0) {
-            usage = SysfsReader.direct().readGpuUsagePercent();
-        }
         if (usage < 0) {
             usage = lastSuccessfulGpuUsage;
         } else {
@@ -554,111 +590,35 @@ public class PerformanceCollector {
         // CPU 温度走独立的 thermal_zone 读取器（v1.8.0）
         data.cpuTemp = CpuTempReader.readCpuTempC();
 
-        boolean sysCharging = lastBatteryStatus == BatteryManager.BATTERY_STATUS_CHARGING
-                || lastBatteryStatus == BatteryManager.BATTERY_STATUS_FULL;
-
         boolean dualCell = NexusBridge.isDualCellEnabled();
+        float dualFactor = dualCell ? Constants.Modules.DUAL_CELL_MULTIPLIER : 1f;
 
-        // 电流带符号：符号就是充放电方向（v1.8.13）。这个比系统报的充电状态可信——
-        // 插着 USB 时系统一直说「充电中」，但游戏功耗超过 USB 供电时电池其实在放电
-        float currentA = readBatteryCurrentA();
-        String status = readBatteryStatusText();
-        boolean discharging = isDischarging(currentA, sysCharging, status);
-        data.isCharging = !discharging;
+        // 电流带符号读出来：负值放电、正值充电（v1.9.12）。
+        //
+        // 方向就靠这一位符号。之前试过 power_now（部分机型没实现，读出来是 0）、
+        // status 节点（只反映充电器接着没有）、电量趋势（太慢），都不成立。
+        // 只有电流是内核普遍实现、且自带方向的实测值
+        // 读出来先归一化成标准语义（负=放电），之后全部用归一化后的值
+        float current = PowerDirection.normalizeCurrent(readBatteryCurrentA());
+        float voltageV = readBatteryVoltageV();
 
-        float absCurrentA = Math.abs(currentA);
-        if (absCurrentA > 0) {
-            float ma = absCurrentA * 1000f;
-            // 双电芯并联时 current_now 多半只报单颗电芯的电流，故与功率一同翻倍。
-            // 注意这里翻的是显示值，传给 PowerTracker 的仍是原始值——
-            // 功率在下面单独乘一次倍率，两处各乘一次，不会重复
-            if (dualCell) {
-                ma *= Constants.Modules.DUAL_CELL_MULTIPLIER;
-            }
-            data.batteryCurrentMa = discharging ? -ma : ma;
+        // 功率 = 电流 × 电压，符号跟归一化后的电流走
+        float signedPower = powerTracker.resolve(current * dualFactor, voltageV);
+
+        PowerDirection.Result dir = PowerDirection.resolve(current, voltageV, dualFactor);
+        data.isCharging = !dir.discharging;
+        if (signedPower != 0f) {
+            data.batteryPowerW = signedPower;
+        } else {
+            // 状态机没给出值时用方向判定的结果兜底
+            data.batteryPowerW = dir.powerW;
         }
 
-        float power = powerTracker.resolve(
-                absCurrentA,
-                readBatteryVoltageV(),
-                () -> SysfsReader.direct().readBatteryPowerW());
-
-        if (power > 0) {
-            // 倍率作用在 resolve 的结果上，故三条来源（电流×电压 / power_now / 陈旧值）
-            // 都会被翻倍，不会因为来源切换而出现忽大忽小
-            if (dualCell) {
-                power *= Constants.Modules.DUAL_CELL_MULTIPLIER;
-            }
-            data.batteryPowerW = discharging ? -power : power;
+        // 电流列同样按方向给符号，保证两列一致
+        if (Math.abs(current) > 0f) {
+            float ma = Math.abs(current) * 1000f * dualFactor;
+            data.batteryCurrentMa = dir.discharging ? -ma : ma;
         }
-    }
-
-    /**
-     * 判断电池是在放电还是在进电（v1.8.13）。
-     *
-     * 为什么要单独判：原来只看系统报的 BATTERY_STATUS_CHARGING，插着 USB 时它
-     * 永远是「充电中」。可功耗超过 USB 供电时电池其实在倒贴，功率却还显示正值。
-     *
-     * 判断依据是电流符号：Android HAL 契约规定 current_now 正数表示流入电池、
-     * 负数表示流出，符号本身就是方向。部分驱动反着给，所以用下面的
-     * calibrateDischargeSign 从明确的样本自动学一次，不假设某一种约定。
-     *
-     * 顺序：
-     * 1. status 明确报 Discharging → 正在放电。这一条同时用来标定符号约定。
-     * 2. 电流绝对值够大且指向放电方向 → 正在放电。这一条会覆盖 status 的说法，
-     *    因为内核在 USB 供电不足时仍可能报 Charging，而电流是实测值。
-     * 3. 其余按 status，再退到系统状态。
-     */
-    private boolean isDischarging(float currentA, boolean sysCharging, String status) {
-        calibrateDischargeSign(currentA, status);
-
-        if (status != null && Constants.Battery.STATUS_DISCHARGING.equalsIgnoreCase(status)) {
-            return true;
-        }
-
-        // 电流够大时以它为准：这是实测方向，能识破「插着 USB、内核还说在充电」
-        if (Math.abs(currentA) >= Constants.Battery.DISCHARGE_HINT_A) {
-            boolean outward = dischargeSign > 0 ? currentA > 0 : currentA < 0;
-            if (outward) {
-                return true;
-            }
-            // 电流明显朝内流，就是在充电，不用再看别的
-            return false;
-        }
-
-        if (status != null) {
-            if (Constants.Battery.STATUS_CHARGING.equalsIgnoreCase(status)
-                    || Constants.Battery.STATUS_FULL.equalsIgnoreCase(status)) {
-                return false;
-            }
-            // Not charging / Unknown：没在进电
-            return true;
-        }
-        return !sysCharging;
-    }
-
-    /**
-     * 从明确的样本学习「放电时电流是正是负」（v1.8.13）。
-     *
-     * 只在 status 报 Discharging、且电流绝对值足够大时学：这时电池确定在放电，
-     * 电流的符号就是答案。小电流的符号没有意义，静止噪声会把约定带偏。
-     *
-     * 学一次就够，之后一直用。日常拔掉充电器用手机时必然会出现这种样本，
-     * 所以插着 USB 之前通常已经学到了。没学到就按 Android 的标准约定（负为放电）。
-     */
-    private void calibrateDischargeSign(float currentA, String status) {
-        if (dischargeSignKnown || status == null) {
-            return;
-        }
-        if (!Constants.Battery.STATUS_DISCHARGING.equalsIgnoreCase(status)) {
-            return;
-        }
-        if (Math.abs(currentA) < Constants.Battery.DISCHARGE_HINT_A) {
-            return;
-        }
-        dischargeSign = currentA > 0 ? 1 : -1;
-        dischargeSignKnown = true;
-        LogUtils.i("discharge sign calibrated: " + dischargeSign);
     }
 
     /**
